@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#151a22">
+
+<style>
+body { margin:0; font-family:system-ui; background:#0e1116; color:white; }
+#app { display:flex; height:100vh; flex-direction:column; }
+#main { display:flex; flex:1; }
+#tree { width:240px; background:#121722; overflow:auto; }
+#editor { flex:1; background:#0b0f14; color:white; border:none; padding:10px; font-family:monospace; }
+#topbar { display:flex; gap:6px; padding:8px; background:#151a22; }
+button { background:#2a3444; color:white; border:none; padding:6px; border-radius:6px; }
+</style>
+</head>
+
+<body>
+<div id="app">
+
+<div id="topbar"></div>
+
+<div id="main">
+    <div id="tree"></div>
+    <textarea id="editor"></textarea>
+</div>
+
+</div>
+
+<script type="module" src="./bootstrap.js"></script>
+</body>
+</html>
