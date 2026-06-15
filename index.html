@@ -325,9 +325,9 @@ input, select, textarea { font-family: var(--mono); }
 
 /* ── Pipeline Sprint: Deploy Modal ───────────────────────────────────────── */
 #deploy-status { padding: 14px; background: var(--bg); border: 1px solid var(--bdr2); border-radius: var(--r-md); margin-bottom: 14px; min-height: 56px; display: flex; flex-direction: column; gap: 6px; }
-.dp-row { display: flex; align-items: center; gap: 8px; font-size: 12px; }
-.dp-icon { font-size: 16px; flex-shrink: 0; }
-.dp-text { flex: 1; color: var(--tx); font-family: var(--ui); }
+.dp-row { display: flex; align-items: flex-start; gap: 8px; font-size: 12px; }
+.dp-icon { font-size: 16px; flex-shrink: 0; margin-top: 1px; }
+.dp-text { flex: 1; color: var(--tx); font-family: var(--ui); word-break: break-word; line-height: 1.45; }
 .dp-text.mu { color: var(--mu); }
 .dp-text.ok { color: var(--ac); font-weight: 700; }
 .dp-text.er { color: var(--er); }
@@ -2346,43 +2346,85 @@ async function startDeploy() {
     _pollDeployment(user, slug);
 
   } catch(err) {
-    _setDeployStatus('&#x274C;', 'Deploy failed: ' + (err.message || err), 'er');
+    const msg = err.message || String(err);
+    _setDeployStatus('&#x274C;', msg, 'er');
     btn.disabled = false; btn.style.opacity = '1';
   }
 }
 
 async function _ensureProjectRepo(user, slug, projName) {
+  // ── Check repo existence ────────────────────────────────────────────────
   let repoExists = false;
+  let repoPrivate = false;
   try {
     const repo = await ghApi(`/repos/${user}/${slug}`);
     repoExists = true;
-    // If it exists but is private, we can't enable Pages — warn but continue
-    if (repo.private) {
-      _setDeployStatus('&#x26A0;&#xFE0F;', `Repo ${slug} is private — Pages requires public. Making public\u2026`, '');
-      await ghApi(`/repos/${user}/${slug}`, 'PATCH', { private: false });
-      await new Promise(r => setTimeout(r, 1000));
+    repoPrivate = repo.private;
+  } catch(e) {
+    // 404 = doesn't exist (fine). Anything else = auth / network issue.
+    if (!e.message.includes('Not Found') && !e.message.includes('404')) {
+      throw new Error(`Repo check failed: ${e.message}`);
     }
-  } catch(e) { repoExists = false; }
-
-  if (!repoExists) {
-    _setDeployStatus('&#x1F527;', `Creating repo ${user}/${slug}\u2026`, '');
-    await ghApi('/user/repos', 'POST', {
-      name:        slug,
-      description: `${projName} — deployed via PixelPad v6.8.0`,
-      private:     false,
-      auto_init:   true
-    });
-    // Wait for GitHub to initialise the repo before we push to it
-    await new Promise(r => setTimeout(r, 2500));
   }
 
-  // Enable / ensure GitHub Pages is on (POST is idempotent — 409 = already on)
+  // ── If private, make it public (Pages needs public repo on free plans) ─
+  if (repoExists && repoPrivate) {
+    _setDeployStatus('&#x26A0;&#xFE0F;', `Repo "${slug}" is private — making public for Pages\u2026`, '');
+    try {
+      await ghApi(`/repos/${user}/${slug}`, 'PATCH', { private: false });
+    } catch(e) {
+      throw new Error(`Couldn\u2019t make repo public: ${e.message}`);
+    }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+
+  // ── Create repo if it doesn't exist ────────────────────────────────────
+  if (!repoExists) {
+    _setDeployStatus('&#x1F527;', `Creating repo ${user}/${slug}\u2026`, '');
+    let createErr = null;
+    try {
+      await ghApi('/user/repos', 'POST', {
+        name:        slug,
+        description: `${projName} \u2014 deployed via PixelPad v6.8.0`,
+        private:     false,
+        auto_init:   true
+      });
+    } catch(e) {
+      createErr = e.message;
+    }
+
+    if (createErr) {
+      // Surface a friendly diagnosis alongside the raw GitHub error
+      let hint = '';
+      if (createErr.includes('already exists'))      hint = 'A repo with this name already exists under your account.';
+      else if (createErr.includes('name'))           hint = 'The project name may contain invalid characters for a repo name.';
+      else if (createErr.includes('401'))            hint = 'Your GitHub Token may be expired or missing the \u201Crepo\u201D scope.';
+      else if (createErr.includes('403'))            hint = 'Your GitHub Token doesn\u2019t have permission to create repos. Check it has the \u201Crepo\u201D scope in GitHub \u2192 Settings \u2192 Developer Settings.';
+      else if (createErr.includes('422'))            hint = 'GitHub rejected the repo name. Try renaming your project to something simpler.';
+      const detail = hint ? `${hint} (GitHub: ${createErr})` : `GitHub said: ${createErr}`;
+      throw new Error(`Repo creation failed \u2014 ${detail}`);
+    }
+
+    // Wait for GitHub to fully initialise the new repo before we push
+    _setDeployStatus('&#x23F3;', 'Waiting for repo to initialise\u2026', '');
+    await new Promise(r => setTimeout(r, 3000));
+  }
+
+  // ── Enable GitHub Pages (POST is idempotent; 409 = already on) ─────────
   try {
     await ghApi(`/repos/${user}/${slug}/pages`, 'POST', {
       source: { branch: 'main', path: '/' }
     });
     await new Promise(r => setTimeout(r, 1000));
-  } catch(e) { /* 409 Conflict = Pages already enabled, safe to ignore */ }
+  } catch(e) {
+    // 409 Conflict = Pages already enabled. 422 = branch not ready yet (will retry on next deploy).
+    // Anything else worth surfacing:
+    if (!e.message.includes('409') && !e.message.includes('Conflict') && !e.message.includes('already enabled')) {
+      // Non-fatal — Pages might still work, just warn in status
+      _setDeployStatus('&#x26A0;&#xFE0F;', `Pages setup warning: ${e.message} \u2014 continuing\u2026`, '');
+      await new Promise(r => setTimeout(r, 1500));
+    }
+  }
 }
 
 function _pollDeployment(user, slug) {
