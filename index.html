@@ -1027,11 +1027,22 @@ function initKeyboard() {
 async function ghApi(path, method = 'GET', body = null) {
   if (!navigator.onLine) throw new Error("Offline.");
   if (!cfg.ghtoken) throw new Error("Missing GitHub Token");
-  const opts = { method, headers: { 'Accept': 'application/vnd.github+json', 'Authorization': `Bearer ${cfg.ghtoken}` } };
+  const opts = { method, headers: { 'Accept': 'application/vnd.github+json', 'Authorization': `Bearer ${cfg.ghtoken}`, 'X-GitHub-Api-Version': '2022-11-28' } };
   if (body) { opts.body = JSON.stringify(body); opts.headers['Content-Type'] = 'application/json'; }
   const res = await fetch(`https://api.github.com${path}`, opts);
   let data; try { data = await res.json(); } catch(e) { data = {}; }
-  if (!res.ok) throw new Error(data.message || `HTTP Error ${res.status}`);
+  if (!res.ok) {
+    // GitHub often hides the real reason in errors[]. Collect all of them.
+    let msg = data.message || `HTTP ${res.status}`;
+    if (Array.isArray(data.errors) && data.errors.length) {
+      const details = data.errors.map(e => e.message || e.code || JSON.stringify(e)).join('; ');
+      msg += ` (${details})`;
+    }
+    const err = new Error(msg);
+    err.status = res.status;
+    err.ghData = data;
+    throw err;
+  }
   return data;
 }
 
@@ -2305,9 +2316,24 @@ async function startDeploy() {
   const slug = proj.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-+|-+$/g, '') || 'my-project';
 
   try {
-    // 1 ── Resolve GitHub username ────────────────────────────────────────
+    // 1 ── Resolve GitHub username + verify PAT scopes ────────────────────
     _setDeployStatus('&#x23F3;', 'Authenticating\u2026', '');
     const user = await ensureGhUser();
+
+    // Check PAT has 'repo' scope — /user returns X-OAuth-Scopes header
+    // We do a raw fetch here so we can inspect headers (ghApi discards them)
+    const scopeRes = await fetch('https://api.github.com/user', {
+      headers: { 'Authorization': `Bearer ${cfg.ghtoken}`, 'Accept': 'application/vnd.github+json' }
+    });
+    const scopes = (scopeRes.headers.get('x-oauth-scopes') || '').split(',').map(s => s.trim());
+    const hasRepo = scopes.includes('repo') || scopes.includes('public_repo');
+    if (!hasRepo && scopes.length > 0) {
+      // Scopes header present but missing repo — tell user exactly what to do
+      throw new Error(
+        `Your GitHub Token is missing the \u201Crepo\u201D scope (current scopes: ${scopes.join(', ') || 'none'}). ` +
+        `Go to GitHub \u2192 Settings \u2192 Developer settings \u2192 Personal access tokens and add the \u201Crepo\u201D scope.`
+      );
+    }
 
     // 2 ── Ensure <slug> repo exists, public, with Pages on main ──────────
     _setDeployStatus('&#x1F4E6;', `Checking repo ${user}/${slug}\u2026`, '');
@@ -2390,6 +2416,7 @@ async function _ensureProjectRepo(user, slug, projName) {
         auto_init:   true
       });
     } catch(e) {
+      console.error('[PixelPad Deploy] Repo creation raw error:', e.ghData || e);
       createErr = e.message;
     }
 
