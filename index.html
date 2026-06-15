@@ -765,7 +765,7 @@ input, select, textarea { font-family: var(--mono); }
   <div class="modal-box">
     <div class="m-pill"></div>
     <div class="m-title">&#x1F680; Deploy Test Build</div>
-    <p style="font-size:11px;color:var(--mu);margin:0 0 12px;line-height:1.5;">Bundles your project into a single file and pushes it to <code style="color:var(--ac);">pixelpad-tests</code> on GitHub Pages.</p>
+    <p style="font-size:11px;color:var(--mu);margin:0 0 12px;line-height:1.5;">Bundles your project and publishes it to its own GitHub Pages repo at <code style="color:var(--ac);">github.com/you/&lt;project&gt;</code>. Auto-creates the repo if it doesn't exist.</p>
     <div id="deploy-status">
       <div class="dp-row"><span class="dp-icon">&#x1F4E6;</span><span class="dp-text mu">Ready to deploy&hellip;</span></div>
     </div>
@@ -2298,16 +2298,22 @@ async function startDeploy() {
   btn.disabled = true;
   btn.style.opacity = '.45';
 
-  // Save active editor buffer
+  // Flush active editor buffer
   if (curFile) persistFile(curFile, ed().getValue());
 
-  try {
-    // 1 ── Ensure pixelpad-tests repo exists ─────────────────────────────
-    _setDeployStatus('&#x23F3;', 'Checking pixelpad-tests repo\u2026', '');
-    const user = await ensureGhUser();
-    await _ensureTestsRepo(user);
+  // Derive repo slug from project name
+  const slug = proj.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-+|-+$/g, '') || 'my-project';
 
-    // 2 ── Bundle project into a single HTML blob ─────────────────────────
+  try {
+    // 1 ── Resolve GitHub username ────────────────────────────────────────
+    _setDeployStatus('&#x23F3;', 'Authenticating\u2026', '');
+    const user = await ensureGhUser();
+
+    // 2 ── Ensure <slug> repo exists, public, with Pages on main ──────────
+    _setDeployStatus('&#x1F4E6;', `Checking repo ${user}/${slug}\u2026`, '');
+    await _ensureProjectRepo(user, slug, proj);
+
+    // 3 ── Bundle project into a single HTML blob ─────────────────────────
     _setDeployStatus('&#x1F4E6;', 'Bundling project\u2026', '');
     const html = bundleProject();
     if (!html) {
@@ -2316,81 +2322,92 @@ async function startDeploy() {
       return;
     }
 
-    // 3 ── Push to pixelpad-tests/apps/<project>/index.html ───────────────
-    const slug    = proj.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-');
-    const path    = `apps/${slug}/index.html`;
+    // 4 ── Push bundle to root index.html on main branch ──────────────────
+    _setDeployStatus('&#x2601;&#xFE0F;', 'Pushing to GitHub\u2026', '');
     const encoded = btoa(unescape(encodeURIComponent(html)));
 
-    _setDeployStatus('&#x2601;&#xFE0F;', 'Pushing to GitHub\u2026', '');
-
-    // Get current SHA if file exists (for update vs create)
     let sha;
     try {
-      const existing = await ghApi(`/repos/${user}/pixelpad-tests/contents/${path}`);
+      const existing = await ghApi(`/repos/${user}/${slug}/contents/index.html`);
       sha = existing.sha;
     } catch(e) { sha = undefined; }
 
-    const body = { message: `Deploy ${proj} — PixelPad v6.8.0`, content: encoded, branch: 'main' };
+    const body = { message: `Deploy ${proj} \u2014 PixelPad v6.8.0`, content: encoded, branch: 'main' };
     if (sha) body.sha = sha;
-    await ghApi(`/repos/${user}/pixelpad-tests/contents/${path}`, 'PUT', body);
+    await ghApi(`/repos/${user}/${slug}/contents/index.html`, 'PUT', body);
 
-    // 4 ── Build the timestamped share URL ────────────────────────────────
+    // 5 ── Build the timestamped share URL ────────────────────────────────
     const ts = Date.now();
-    _deployUrl = `https://${user}.github.io/pixelpad-tests/${path}?v=${ts}`;
+    _deployUrl = `https://${user}.github.io/${slug}/?v=${ts}`;
     document.getElementById('deploy-url-out').textContent = _deployUrl;
 
-    // 5 ── Start background polling ────────────────────────────────────────
-    _setDeployStatus('&#x23F3;', 'GitHub is spinning up your testing link\u2026', '');
-    _pollDeployment(user, ts);
+    // 6 ── Background poll until Pages reports built ───────────────────────
+    _setDeployStatus('&#x23F3;', 'GitHub is spinning up your Pages link\u2026', '');
+    _pollDeployment(user, slug);
 
   } catch(err) {
-    _setDeployStatus('&#x274C;', 'Deploy failed: ' + err.message, 'er');
+    _setDeployStatus('&#x274C;', 'Deploy failed: ' + (err.message || err), 'er');
     btn.disabled = false; btn.style.opacity = '1';
   }
 }
 
-async function _ensureTestsRepo(user) {
+async function _ensureProjectRepo(user, slug, projName) {
+  let repoExists = false;
   try {
-    await ghApi(`/repos/${user}/pixelpad-tests`);
-  } catch(e) {
-    // Repo doesn't exist — create it with Pages enabled
+    const repo = await ghApi(`/repos/${user}/${slug}`);
+    repoExists = true;
+    // If it exists but is private, we can't enable Pages — warn but continue
+    if (repo.private) {
+      _setDeployStatus('&#x26A0;&#xFE0F;', `Repo ${slug} is private — Pages requires public. Making public\u2026`, '');
+      await ghApi(`/repos/${user}/${slug}`, 'PATCH', { private: false });
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  } catch(e) { repoExists = false; }
+
+  if (!repoExists) {
+    _setDeployStatus('&#x1F527;', `Creating repo ${user}/${slug}\u2026`, '');
     await ghApi('/user/repos', 'POST', {
-      name: 'pixelpad-tests',
-      description: 'PixelPad test builds',
-      private: false,
-      auto_init: true
+      name:        slug,
+      description: `${projName} — deployed via PixelPad v6.8.0`,
+      private:     false,
+      auto_init:   true
     });
-    // Enable GitHub Pages on main branch
-    try {
-      await ghApi(`/repos/${user}/pixelpad-tests/pages`, 'POST', {
-        source: { branch: 'main', path: '/' }
-      });
-    } catch(e) { /* Pages may already be enabled */ }
-    // Brief pause for repo to initialise
-    await new Promise(r => setTimeout(r, 2000));
+    // Wait for GitHub to initialise the repo before we push to it
+    await new Promise(r => setTimeout(r, 2500));
   }
+
+  // Enable / ensure GitHub Pages is on (POST is idempotent — 409 = already on)
+  try {
+    await ghApi(`/repos/${user}/${slug}/pages`, 'POST', {
+      source: { branch: 'main', path: '/' }
+    });
+    await new Promise(r => setTimeout(r, 1000));
+  } catch(e) { /* 409 Conflict = Pages already enabled, safe to ignore */ }
 }
 
-function _pollDeployment(user, ts) {
+function _pollDeployment(user, slug) {
   clearInterval(_deployPoll);
   let attempts = 0;
-  const MAX = 30; // 60 s max (2 s intervals)
+  const MAX = 40; // 80 s max (2 s intervals) — new repos take longer
 
   _deployPoll = setInterval(async () => {
     attempts++;
     if (attempts > MAX) {
       clearInterval(_deployPoll);
-      // Timeout — show URL anyway, Pages may just be slow
+      // Timeout — surface the URL anyway; Pages may just be slow
       _finaliseDeployUrl();
       return;
     }
     try {
-      const data = await ghApi(`/repos/${user}/pixelpad-tests/pages`);
-      if (data && data.status === 'built') {
-        clearInterval(_deployPoll);
-        _finaliseDeployUrl();
+      const data = await ghApi(`/repos/${user}/${slug}/pages`);
+      if (data && (data.status === 'built' || data.status === 'building')) {
+        if (data.status === 'built') {
+          clearInterval(_deployPoll);
+          _finaliseDeployUrl();
+        }
+        // if 'building', keep polling
       }
-    } catch(e) { /* keep polling */ }
+    } catch(e) { /* pages endpoint may 404 briefly after creation — keep polling */ }
   }, 2000);
 }
 
