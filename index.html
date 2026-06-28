@@ -9,7 +9,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black">
 <meta name="apple-mobile-web-app-title" content="PixelPad">
 <link rel="manifest" href="./manifest.json">
-<title>pixelpadv6.8.3</title>
+<title>pixelpadv6.8.4</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.3/ace.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
@@ -807,7 +807,10 @@ input, select, textarea { font-family: var(--mono); }
 <div class="modal" id="mod-deploy-check">
   <div class="modal-box">
     <div class="m-pill"></div>
-    <div class="m-title">&#x26A0;&#xFE0F; File Names Need Fixing</div>
+    <div class="m-title" style="display:flex;align-items:center;justify-content:space-between;">
+      <span>&#x26A0;&#xFE0F; File Names Need Fixing</span>
+      <button onclick="closeModal('mod-deploy-check')" style="background:none;border:none;color:var(--mu);font-size:20px;line-height:1;padding:0 2px;cursor:pointer;">&times;</button>
+    </div>
     <p class="dfc-note">GitHub Pages requires an <code style="color:var(--ac)">index.html</code> at the root. Your project has:</p>
     <div class="dfc-file-list" id="dfc-file-list"></div>
     <p class="dfc-note" id="dfc-hint"></p>
@@ -822,7 +825,10 @@ input, select, textarea { font-family: var(--mono); }
 <div class="modal" id="mod-deploy">
   <div class="modal-box">
     <div class="m-pill"></div>
-    <div class="m-title">&#x1F680; Deploy Test Build</div>
+    <div class="m-title" style="display:flex;align-items:center;justify-content:space-between;">
+      <span>&#x1F680; Deploy Test Build</span>
+      <button onclick="closeModal('mod-deploy')" style="background:none;border:none;color:var(--mu);font-size:20px;line-height:1;padding:0 2px;cursor:pointer;">&times;</button>
+    </div>
     <p style="font-size:11px;color:var(--mu);margin:0 0 12px;line-height:1.5;">Bundles your project and publishes it to its own GitHub Pages repo at <code style="color:var(--ac);">github.com/you/&lt;project&gt;</code>. Auto-creates the repo if it doesn't exist.</p>
     <div id="deploy-status">
       <div class="dp-row"><span class="dp-icon">&#x1F4E6;</span><span class="dp-text mu">Ready to deploy&hellip;</span></div>
@@ -2555,7 +2561,9 @@ async function startDeploy() {
   try {
     // 1 ── Auth + scope check ─────────────────────────────────────────────
     _setDeployStatus('&#x23F3;', 'Authenticating\u2026', '');
-    const user = await ensureGhUser();
+    const authOk = await ensureGhUser();
+    if (!authOk) throw new Error('GitHub Token invalid or missing. Add it in Settings.');
+    const user = ghUserCache; // the actual login string e.g. "joshmaxwell"
 
     const scopeRes = await fetch('https://api.github.com/user', {
       headers: { 'Authorization': `Bearer ${cfg.ghtoken}`, 'Accept': 'application/vnd.github+json' }
