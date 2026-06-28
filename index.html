@@ -2387,15 +2387,20 @@ async function _ensureProjectRepo(user, slug, projName) {
     repoExists = true;
     repoPrivate = repo.private;
   } catch(e) {
-    // 404 = doesn't exist (fine). Anything else = auth / network issue.
-    if (!e.message.includes('Not Found') && !e.message.includes('404')) {
-      throw new Error(`Repo check failed: ${e.message}`);
+    const status = e.status || 0;
+    if (status === 404 || e.message.includes('Not Found')) {
+      repoExists = false; // definitely doesn't exist — proceed to create
+    } else if (status >= 500 || status === 0) {
+      throw new Error(`GitHub unreachable while checking repo: ${e.message}`);
+    } else {
+      // 401 / 403 — auth problem, surface immediately
+      throw new Error(`Repo check failed (HTTP ${status}): ${e.message}`);
     }
   }
 
-  // ── If private, make it public (Pages needs public repo on free plans) ─
+  // ── If private, make it public (Pages needs public on free plans) ──────
   if (repoExists && repoPrivate) {
-    _setDeployStatus('&#x26A0;&#xFE0F;', `Repo "${slug}" is private — making public for Pages\u2026`, '');
+    _setDeployStatus('&#x26A0;&#xFE0F;', `Repo "${slug}" is private \u2014 making public for Pages\u2026`, '');
     try {
       await ghApi(`/repos/${user}/${slug}`, 'PATCH', { private: false });
     } catch(e) {
@@ -2407,7 +2412,6 @@ async function _ensureProjectRepo(user, slug, projName) {
   // ── Create repo if it doesn't exist ────────────────────────────────────
   if (!repoExists) {
     _setDeployStatus('&#x1F527;', `Creating repo ${user}/${slug}\u2026`, '');
-    let createErr = null;
     try {
       await ghApi('/user/repos', 'POST', {
         name:        slug,
@@ -2415,40 +2419,38 @@ async function _ensureProjectRepo(user, slug, projName) {
         private:     false,
         auto_init:   true
       });
+      // Wait for GitHub to fully initialise before we push
+      _setDeployStatus('&#x23F3;', 'Waiting for repo to initialise\u2026', '');
+      await new Promise(r => setTimeout(r, 3000));
     } catch(e) {
-      console.error('[PixelPad Deploy] Repo creation raw error:', e.ghData || e);
-      createErr = e.message;
+      console.error('[PixelPad Deploy] Repo creation error:', e.ghData || e);
+      const msg = e.message || '';
+      // "Already exists" is not a real error — repo is there, just continue
+      const alreadyExists = msg.includes('already exists') || msg.includes('name already exists') || e.status === 422;
+      if (!alreadyExists) {
+        let hint = '';
+        if (e.status === 401) hint = 'Your GitHub Token is expired or invalid.';
+        else if (e.status === 403) hint = 'Token lacks permission. Enable the \u201Crepo\u201D scope in GitHub \u2192 Settings \u2192 Developer settings \u2192 Personal access tokens.';
+        else if (e.status === 422) hint = 'GitHub rejected the name. Try renaming your project to something simpler (letters, numbers, hyphens only).';
+        throw new Error(hint ? `${hint}\n\nGitHub said: ${msg}` : `Repo creation failed: ${msg}`);
+      }
+      // Already exists — treat as success, fall through
+      _setDeployStatus('&#x2705;', `Repo ${user}/${slug} already exists \u2014 continuing\u2026`, '');
+      await new Promise(r => setTimeout(r, 600));
     }
-
-    if (createErr) {
-      // Surface a friendly diagnosis alongside the raw GitHub error
-      let hint = '';
-      if (createErr.includes('already exists'))      hint = 'A repo with this name already exists under your account.';
-      else if (createErr.includes('name'))           hint = 'The project name may contain invalid characters for a repo name.';
-      else if (createErr.includes('401'))            hint = 'Your GitHub Token may be expired or missing the \u201Crepo\u201D scope.';
-      else if (createErr.includes('403'))            hint = 'Your GitHub Token doesn\u2019t have permission to create repos. Check it has the \u201Crepo\u201D scope in GitHub \u2192 Settings \u2192 Developer Settings.';
-      else if (createErr.includes('422'))            hint = 'GitHub rejected the repo name. Try renaming your project to something simpler.';
-      const detail = hint ? `${hint} (GitHub: ${createErr})` : `GitHub said: ${createErr}`;
-      throw new Error(`Repo creation failed \u2014 ${detail}`);
-    }
-
-    // Wait for GitHub to fully initialise the new repo before we push
-    _setDeployStatus('&#x23F3;', 'Waiting for repo to initialise\u2026', '');
-    await new Promise(r => setTimeout(r, 3000));
   }
 
-  // ── Enable GitHub Pages (POST is idempotent; 409 = already on) ─────────
+  // ── Enable GitHub Pages (409 = already on, safe to ignore) ─────────────
   try {
     await ghApi(`/repos/${user}/${slug}/pages`, 'POST', {
       source: { branch: 'main', path: '/' }
     });
     await new Promise(r => setTimeout(r, 1000));
   } catch(e) {
-    // 409 Conflict = Pages already enabled. 422 = branch not ready yet (will retry on next deploy).
-    // Anything else worth surfacing:
-    if (!e.message.includes('409') && !e.message.includes('Conflict') && !e.message.includes('already enabled')) {
-      // Non-fatal — Pages might still work, just warn in status
-      _setDeployStatus('&#x26A0;&#xFE0F;', `Pages setup warning: ${e.message} \u2014 continuing\u2026`, '');
+    const msg = e.message || '';
+    // 409 Conflict / "already enabled" = Pages already on — fine
+    if (!msg.includes('409') && !msg.includes('Conflict') && !msg.includes('already') && e.status !== 409) {
+      _setDeployStatus('&#x26A0;&#xFE0F;', `Pages setup warning: ${msg} \u2014 continuing\u2026`, '');
       await new Promise(r => setTimeout(r, 1500));
     }
   }
