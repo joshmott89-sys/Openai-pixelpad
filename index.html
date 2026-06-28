@@ -2580,22 +2580,36 @@ async function startDeploy() {
       throw new Error('No index.html found in project. Add one and try again.');
     }
 
-    // 4 ── Push index.html to main ─────────────────────────────────────────
+    // 4 ── Push index.html to main — retry if branch not ready yet ────────
     _setDeployStatus('&#x2601;&#xFE0F;', `Pushing to ${user}/${slug}\u2026`, '');
     const encoded = btoa(unescape(encodeURIComponent(html)));
-    let sha;
-    try {
-      const existing = await ghApi(`/repos/${user}/${slug}/contents/index.html`);
-      sha = existing.sha;
-    } catch(e) { sha = undefined; }
 
-    const body = { message: `Deploy ${proj} \u2014 PixelPad v6.8.0`, content: encoded, branch: 'main' };
-    if (sha) body.sha = sha;
-    await ghApi(`/repos/${user}/${slug}/contents/index.html`, 'PUT', body);
+    let pushOk = false;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        let sha;
+        try {
+          const existing = await ghApi(`/repos/${user}/${slug}/contents/index.html`);
+          sha = existing.sha;
+        } catch(e) { sha = undefined; }
+
+        const body = { message: `Deploy ${proj} \u2014 PixelPad v6.8.0`, content: encoded, branch: 'main' };
+        if (sha) body.sha = sha;
+        await ghApi(`/repos/${user}/${slug}/contents/index.html`, 'PUT', body);
+        pushOk = true;
+        break;
+      } catch(e) {
+        const isNotReady = e.status === 404 || e.status === 409 || e.message.includes('Not Found') || e.message.includes('not found');
+        if (isNotReady && attempt < 4) {
+          _setDeployStatus('&#x23F3;', `Waiting for repo branch to be ready\u2026 (${(attempt+1)*3}s)`, 'mu');
+          await new Promise(r => setTimeout(r, 3000));
+        } else {
+          throw new Error(`Push failed: ${e.message}`);
+        }
+      }
+    }
 
     // 5 ── Enable Pages now that main has a commit ─────────────────────────
-    // GitHub requires at least one commit on the branch before Pages can be enabled.
-    // We do this AFTER the push so it always works, including brand new repos.
     _setDeployStatus('&#x1F310;', 'Enabling GitHub Pages\u2026', '');
     try {
       await ghApi(`/repos/${user}/${slug}/pages`, 'POST', {
@@ -2603,8 +2617,8 @@ async function startDeploy() {
       });
       await new Promise(r => setTimeout(r, 1500));
     } catch(e) {
-      // 409 = already enabled — perfect. Anything else is non-fatal, log it.
-      if (e.status !== 409 && !e.message.includes('409') && !e.message.includes('Conflict')) {
+      // 409 = already enabled. 422 = GitHub needs a moment, poll will retry.
+      if (e.status !== 409 && e.status !== 422 && !e.message.includes('Conflict')) {
         console.warn('[PixelPad Deploy] Pages enable:', e.status, e.message);
       }
     }
@@ -2613,11 +2627,12 @@ async function startDeploy() {
     const ts = Date.now();
     _deployUrl = `https://${user}.github.io/${slug}/?v=${ts}`;
     _setDeployCache(proj, _deployUrl);
+    document.getElementById('deploy-url-row').classList.add('on');
     document.getElementById('deploy-url-out').textContent = _deployUrl;
 
     // 7 ── Non-blocking poll ───────────────────────────────────────────────
-    _setDeployStatus('&#x23F3;', 'GitHub is building your Pages site\u2026', '');
-    _pillShow(`Building ${proj}\u2026`, '');
+    // Note: pill is only shown if/when user closes the modal
+    _setDeployStatus('&#x23F3;', 'GitHub is building your Pages site\u2026 you can close this and keep coding.', 'mu');
     _pollDeployment(user, slug);
 
   } catch(err) {
@@ -2708,7 +2723,7 @@ function _pollDeployment(user, slug) {
     // Update status — pill only shown when modal is closed
     const modOpen = document.getElementById('mod-deploy').classList.contains('on');
     if (modOpen) {
-      _setDeployStatus('&#x23F3;', `GitHub is building\u2026 ${elapsed}s`, 'mu');
+      _setDeployStatus('&#x23F3;', `GitHub is building\u2026 ${elapsed}s &mdash; you can close this and keep coding.`, 'mu');
     } else {
       _pillShow(`Building\u2026 ${elapsed}s`, '');
     }
@@ -2723,8 +2738,7 @@ function _pollDeployment(user, slug) {
       }
       // queued / building — keep polling
     } catch(e) {
-      // 404 means Pages not yet registered — retry enabling it (GitHub sometimes
-      // needs a few seconds after the push before the Pages API will accept POST)
+      // 404 = Pages not yet registered — retry enabling it
       if ((e.status === 404 || e.message.includes('Not Found')) && pagesRetries < MAX_PAGES_RETRIES) {
         pagesRetries++;
         console.log(`[PixelPad Deploy] Pages 404 — retry enable attempt ${pagesRetries}`);
@@ -2733,11 +2747,15 @@ function _pollDeployment(user, slug) {
             source: { branch: 'main', path: '/' }
           });
         } catch(pe) {
-          // 409 = now enabled, next poll will see it. Anything else we log.
-          if (pe.status !== 409 && !pe.message.includes('Conflict')) {
+          if (pe.status !== 409 && pe.status !== 422 && !pe.message.includes('Conflict')) {
             console.warn('[PixelPad Deploy] Pages re-enable:', pe.status, pe.message);
           }
         }
+      } else if (pagesRetries >= MAX_PAGES_RETRIES) {
+        // Gave up enabling Pages — surface URL anyway, it may still work
+        clearInterval(_deployPoll);
+        _deployActive = false;
+        _finaliseDeployUrl(true);
       }
     }
   }, 2000);
