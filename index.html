@@ -9,7 +9,7 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black">
 <meta name="apple-mobile-web-app-title" content="PixelPad">
 <link rel="manifest" href="./manifest.json">
-<title>pixelpadv6.8.0</title>
+<title>pixelpadv6.8.1</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/ace/1.32.3/ace.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
@@ -339,8 +339,51 @@ input, select, textarea { font-family: var(--mono); }
 .dp-share-btn:active { background: var(--card); }
 .dp-share-btn.hi { background: var(--ac); border-color: var(--ac); color: #000; }
 
+/* ── Deploy floating pill (non-blocking status) ──────────────────────────── */
+#deploy-pill {
+  display: none;
+  position: fixed;
+  bottom: 72px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--card);
+  border: 1px solid var(--bdr2);
+  border-radius: 20px;
+  padding: 8px 14px 8px 10px;
+  font-size: 12px;
+  font-family: var(--ui);
+  color: var(--tx);
+  z-index: 999;
+  box-shadow: 0 4px 16px rgba(0,0,0,.35);
+  white-space: nowrap;
+  gap: 8px;
+  align-items: center;
+  cursor: pointer;
+  max-width: 90vw;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+#deploy-pill.on { display: flex; }
+#deploy-pill-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--wa); flex-shrink: 0; animation: pulse-dot 1s infinite; }
+#deploy-pill.done #deploy-pill-dot { background: var(--ac); animation: none; }
+#deploy-pill.err #deploy-pill-dot { background: var(--er); animation: none; }
+/* ── Deploy file-check prompt ─────────────────────────────────────────────── */
+#mod-deploy-check .modal-box { gap: 10px; }
+.dfc-file-list { display: flex; flex-direction: column; gap: 6px; margin: 4px 0 10px; }
+.dfc-file-row { display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: var(--bg); border: 1px solid var(--bdr2); border-radius: var(--r-sm); font-size: 12px; font-family: var(--mono); }
+.dfc-file-row.warn { border-color: var(--wa); }
+.dfc-file-row.ok   { border-color: var(--ac); }
+.dfc-badge { font-size: 10px; padding: 2px 6px; border-radius: 8px; font-family: var(--ui); font-weight: 700; flex-shrink: 0; }
+.dfc-badge.warn { background: rgba(255,180,0,.18); color: var(--wa); }
+.dfc-badge.ok   { background: rgba(0,200,120,.12); color: var(--ac); }
+.dfc-badge.err  { background: rgba(255,80,80,.12); color: var(--er); }
+.dfc-msg { flex: 1; color: var(--tx); }
+.dfc-note { font-size: 11px; color: var(--mu); line-height: 1.5; margin: 0; }
+
 /* Distribute tab button */
 .t-btn.dist { color: var(--gem); }
+
+</style>
 
 </style>
 </head>
@@ -760,6 +803,21 @@ input, select, textarea { font-family: var(--mono); }
   </div>
 </div>
 
+<!-- ── Deploy: File Name Check Modal ──────────────────────────────────────── -->
+<div class="modal" id="mod-deploy-check">
+  <div class="modal-box">
+    <div class="m-pill"></div>
+    <div class="m-title">&#x26A0;&#xFE0F; File Names Need Fixing</div>
+    <p class="dfc-note">GitHub Pages requires an <code style="color:var(--ac)">index.html</code> at the root. Your project has:</p>
+    <div class="dfc-file-list" id="dfc-file-list"></div>
+    <p class="dfc-note" id="dfc-hint"></p>
+    <div class="m-row" style="margin-top:12px;">
+      <button class="m-btn ghost" onclick="closeModal('mod-deploy-check')">Cancel</button>
+      <button class="m-btn go" id="dfc-fix-btn" onclick="_deployFixAndContinue()">&#x270F;&#xFE0F; Rename &amp; Deploy</button>
+    </div>
+  </div>
+</div>
+
 <!-- ── Deploy Test Build Modal ──────────────────────────────────────────── -->
 <div class="modal" id="mod-deploy">
   <div class="modal-box">
@@ -781,6 +839,11 @@ input, select, textarea { font-family: var(--mono); }
       <button class="m-btn go" id="deploy-go-btn" onclick="startDeploy()">&#x1F680; Deploy</button>
     </div>
   </div>
+</div>
+
+<div id="deploy-pill" onclick="deployTestBuild()">
+  <span id="deploy-pill-dot"></span>
+  <span id="deploy-pill-txt">Deploying…</span>
 </div>
 
 <div id="toast"></div>
@@ -2285,18 +2348,171 @@ function restBackup(inp) {
 // ── State ──────────────────────────────────────────────────────────────────
 let _deployUrl  = '';
 let _deployPoll = null;
+let _deployActive = false;
+
+// ── Helpers: cached URLs per project ──────────────────────────────────────
+function _getDeployCache() {
+  try { return JSON.parse(localStorage.getItem('pp_deploy_urls') || '{}'); } catch(e) { return {}; }
+}
+function _setDeployCache(proj, url) {
+  try {
+    const cache = _getDeployCache();
+    cache[proj] = url;
+    localStorage.setItem('pp_deploy_urls', JSON.stringify(cache));
+  } catch(e) {}
+}
+
+// ── Floating pill ──────────────────────────────────────────────────────────
+function _pillShow(text, state) { // state: '' | 'done' | 'err'
+  const pill = document.getElementById('deploy-pill');
+  const txt  = document.getElementById('deploy-pill-txt');
+  pill.className = 'on' + (state ? ' ' + state : '');
+  txt.textContent = text;
+}
+function _pillHide() {
+  document.getElementById('deploy-pill').className = '';
+}
 
 // ── Open Deploy modal ──────────────────────────────────────────────────────
 function deployTestBuild() {
-  // Reset modal to idle state
+  const proj  = W.activeProject;
+  const cache = _getDeployCache();
+  const saved = proj && cache[proj];
+
+  // If a deploy is actively running, just open the modal to show progress
+  if (_deployActive) {
+    openModal('mod-deploy');
+    return;
+  }
+
+  // Reset modal
   _deployUrl = '';
   document.getElementById('deploy-url-row').classList.remove('on');
   document.getElementById('deploy-url-out').textContent = '';
-  _setDeployStatus('&#x1F4E6;', 'Ready to deploy\u2026', '');
+
+  if (saved) {
+    // Surface last known URL immediately
+    _deployUrl = saved;
+    document.getElementById('deploy-url-out').textContent = saved;
+    document.getElementById('deploy-url-row').classList.add('on');
+    _setDeployStatus('&#x2705;', 'Last deploy URL (tap Deploy to push a new build):', 'ok');
+  } else {
+    _setDeployStatus('&#x1F4E6;', 'Ready to deploy\u2026', '');
+  }
+
   const btn = document.getElementById('deploy-go-btn');
   btn.disabled = false;
   btn.style.opacity = '1';
+  btn.innerHTML = '&#x1F680; Deploy';
   openModal('mod-deploy');
+}
+
+// ── Pre-deploy file name check ─────────────────────────────────────────────
+// Returns { ok: true } if ready to deploy, or shows the fix modal and returns { ok: false }
+let _deployPendingRename = null; // { from: string, to: 'index.html' } | null
+
+function _checkDeployFiles() {
+  const files   = activeFiles();
+  const names   = Object.keys(files);
+  const htmlFiles = names.filter(n => /\.html?$/i.test(n));
+
+  // ── Case 1: No files at all ────────────────────────────────────────────
+  if (!names.length) {
+    toast('Project is empty — add an index.html first.', 'bad');
+    return { ok: false };
+  }
+
+  // ── Case 2: Has index.html — all good ─────────────────────────────────
+  if (names.includes('index.html')) return { ok: true };
+
+  // ── Case 3: No HTML files — can't deploy ──────────────────────────────
+  if (!htmlFiles.length) {
+    toast('No HTML file found. Add an index.html to deploy.', 'bad');
+    return { ok: false };
+  }
+
+  // ── Case 4: One HTML file, wrong name — offer rename ──────────────────
+  if (htmlFiles.length === 1) {
+    _deployPendingRename = { from: htmlFiles[0], to: 'index.html' };
+    _showDeployFileCheck(
+      [{ name: htmlFiles[0], badge: 'warn', label: 'wrong name' }],
+      `GitHub Pages will only serve <code style="color:var(--ac)">index.html</code> as your site root. ` +
+      `Tap "Rename & Deploy" to rename <b>${htmlFiles[0]}</b> → <b>index.html</b> and continue.`
+    );
+    return { ok: false };
+  }
+
+  // ── Case 5: Multiple HTML files, none is index.html — pick the best ───
+  // Score: prefer shorter names, prefer names containing 'app'/'main'/'home'
+  const scored = htmlFiles.map(n => {
+    let score = 0;
+    const base = n.replace(/\.html?$/i, '').toLowerCase();
+    if (['app','main','home','index','game','site'].includes(base)) score += 10;
+    score -= n.length; // shorter = better
+    return { name: n, score };
+  }).sort((a, b) => b.score - a.score);
+
+  const best = scored[0].name;
+  _deployPendingRename = { from: best, to: 'index.html' };
+
+  const rows = htmlFiles.map(n => ({
+    name: n,
+    badge: n === best ? 'warn' : 'err',
+    label: n === best ? 'will rename' : 'not used'
+  }));
+
+  _showDeployFileCheck(
+    rows,
+    `No <b>index.html</b> found. PixelPad will rename <b>${best}</b> → <b>index.html</b> for the deploy. ` +
+    `Other HTML files won't be affected. You can cancel and rename manually if you prefer a different entry point.`
+  );
+  return { ok: false };
+}
+
+function _showDeployFileCheck(rows, hint) {
+  const list = document.getElementById('dfc-file-list');
+  list.innerHTML = rows.map(r =>
+    `<div class="dfc-file-row ${r.badge === 'ok' ? 'ok' : 'warn'}">
+      <span class="dfc-badge ${r.badge}">${r.label}</span>
+      <span class="dfc-msg">${r.name}</span>
+    </div>`
+  ).join('');
+  document.getElementById('dfc-hint').innerHTML = hint;
+  closeModal('mod-deploy');
+  openModal('mod-deploy-check');
+}
+
+async function _deployFixAndContinue() {
+  closeModal('mod-deploy-check');
+
+  if (_deployPendingRename) {
+    const { from, to } = _deployPendingRename;
+    const proj = W.activeProject;
+    if (proj && W.projects[proj]) {
+      const files = W.projects[proj].files || {};
+      if (files[from] && from !== to) {
+        // Copy content to new name, delete old name
+        files[to] = { ...files[from] };
+        delete files[from];
+        W.projects[proj].files = files;
+        saveWorkspace();
+        // If the renamed file was open, switch to the new name
+        if (curFile === from) {
+          curFile = to;
+          renderSide();
+        } else {
+          renderSide();
+        }
+        toast(`Renamed ${from} → ${to}`, 'ok');
+        await new Promise(r => setTimeout(r, 400));
+      }
+    }
+    _deployPendingRename = null;
+  }
+
+  // Re-open deploy modal and kick off the deploy
+  openModal('mod-deploy');
+  await startDeploy();
 }
 
 // ── Called by the modal's Deploy button ───────────────────────────────────
@@ -2312,46 +2528,52 @@ async function startDeploy() {
   // Flush active editor buffer
   if (curFile) persistFile(curFile, ed().getValue());
 
-  // Derive repo slug from project name
+  // ── Pre-flight: check file names before touching GitHub ───────────────
+  const fileCheck = _checkDeployFiles();
+  if (!fileCheck.ok) {
+    // Modal has been shown — re-enable button so user can try again after fixing
+    btn.disabled = false;
+    btn.style.opacity = '1';
+    return;
+  }
+
+  // Derive safe repo slug from project name
   const slug = proj.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-+|-+$/g, '') || 'my-project';
 
+  _deployActive = true;
+  _pillShow(`Deploying ${proj}\u2026`, '');
+
   try {
-    // 1 ── Resolve GitHub username + verify PAT scopes ────────────────────
+    // 1 ── Auth + scope check ─────────────────────────────────────────────
     _setDeployStatus('&#x23F3;', 'Authenticating\u2026', '');
     const user = await ensureGhUser();
 
-    // Check PAT has 'repo' scope — /user returns X-OAuth-Scopes header
-    // We do a raw fetch here so we can inspect headers (ghApi discards them)
     const scopeRes = await fetch('https://api.github.com/user', {
       headers: { 'Authorization': `Bearer ${cfg.ghtoken}`, 'Accept': 'application/vnd.github+json' }
     });
-    const scopes = (scopeRes.headers.get('x-oauth-scopes') || '').split(',').map(s => s.trim());
-    const hasRepo = scopes.includes('repo') || scopes.includes('public_repo');
-    if (!hasRepo && scopes.length > 0) {
-      // Scopes header present but missing repo — tell user exactly what to do
+    const scopes = (scopeRes.headers.get('x-oauth-scopes') || '').split(',').map(s => s.trim()).filter(Boolean);
+    const hasRepo = scopes.length === 0 || scopes.includes('repo') || scopes.includes('public_repo');
+    if (!hasRepo) {
       throw new Error(
-        `Your GitHub Token is missing the \u201Crepo\u201D scope (current scopes: ${scopes.join(', ') || 'none'}). ` +
-        `Go to GitHub \u2192 Settings \u2192 Developer settings \u2192 Personal access tokens and add the \u201Crepo\u201D scope.`
+        `Token missing \u201Crepo\u201D scope (current: ${scopes.join(', ') || 'none'}). ` +
+        `GitHub \u2192 Settings \u2192 Developer settings \u2192 Personal access tokens.`
       );
     }
 
-    // 2 ── Ensure <slug> repo exists, public, with Pages on main ──────────
+    // 2 ── Ensure repo exists and is public ───────────────────────────────
     _setDeployStatus('&#x1F4E6;', `Checking repo ${user}/${slug}\u2026`, '');
-    await _ensureProjectRepo(user, slug, proj);
+    await _ensureRepoPublic(user, slug, proj);
 
-    // 3 ── Bundle project into a single HTML blob ─────────────────────────
+    // 3 ── Bundle project ──────────────────────────────────────────────────
     _setDeployStatus('&#x1F4E6;', 'Bundling project\u2026', '');
     const html = bundleProject();
     if (!html) {
-      _setDeployStatus('&#x26A0;&#xFE0F;', 'No index.html found in project.', 'er');
-      btn.disabled = false; btn.style.opacity = '1';
-      return;
+      throw new Error('No index.html found in project. Add one and try again.');
     }
 
-    // 4 ── Push bundle to root index.html on main branch ──────────────────
-    _setDeployStatus('&#x2601;&#xFE0F;', 'Pushing to GitHub\u2026', '');
+    // 4 ── Push index.html to main ─────────────────────────────────────────
+    _setDeployStatus('&#x2601;&#xFE0F;', `Pushing to ${user}/${slug}\u2026`, '');
     const encoded = btoa(unescape(encodeURIComponent(html)));
-
     let sha;
     try {
       const existing = await ghApi(`/repos/${user}/${slug}/contents/index.html`);
@@ -2362,54 +2584,71 @@ async function startDeploy() {
     if (sha) body.sha = sha;
     await ghApi(`/repos/${user}/${slug}/contents/index.html`, 'PUT', body);
 
-    // 5 ── Build the timestamped share URL ────────────────────────────────
+    // 5 ── Enable Pages now that main has a commit ─────────────────────────
+    // GitHub requires at least one commit on the branch before Pages can be enabled.
+    // We do this AFTER the push so it always works, including brand new repos.
+    _setDeployStatus('&#x1F310;', 'Enabling GitHub Pages\u2026', '');
+    try {
+      await ghApi(`/repos/${user}/${slug}/pages`, 'POST', {
+        source: { branch: 'main', path: '/' }
+      });
+      await new Promise(r => setTimeout(r, 1500));
+    } catch(e) {
+      // 409 = already enabled — perfect. Anything else is non-fatal, log it.
+      if (e.status !== 409 && !e.message.includes('409') && !e.message.includes('Conflict')) {
+        console.warn('[PixelPad Deploy] Pages enable:', e.status, e.message);
+      }
+    }
+
+    // 6 ── Build timestamped share URL + cache it ──────────────────────────
     const ts = Date.now();
     _deployUrl = `https://${user}.github.io/${slug}/?v=${ts}`;
+    _setDeployCache(proj, _deployUrl);
     document.getElementById('deploy-url-out').textContent = _deployUrl;
 
-    // 6 ── Background poll until Pages reports built ───────────────────────
-    _setDeployStatus('&#x23F3;', 'GitHub is spinning up your Pages link\u2026', '');
+    // 7 ── Non-blocking poll ───────────────────────────────────────────────
+    _setDeployStatus('&#x23F3;', 'GitHub is building your Pages site\u2026', '');
+    _pillShow(`Building ${proj}\u2026`, '');
     _pollDeployment(user, slug);
 
   } catch(err) {
+    _deployActive = false;
     const msg = err.message || String(err);
     _setDeployStatus('&#x274C;', msg, 'er');
-    btn.disabled = false; btn.style.opacity = '1';
+    _pillShow(`Deploy failed: ${msg}`, 'err');
+    btn.disabled = false;
+    btn.style.opacity = '1';
+    btn.innerHTML = '&#x1F680; Retry';
   }
 }
 
-async function _ensureProjectRepo(user, slug, projName) {
-  // ── Check repo existence ────────────────────────────────────────────────
+// ── Ensure repo exists and is public (no Pages setup here — needs a commit first) ──
+async function _ensureRepoPublic(user, slug, projName) {
   let repoExists = false;
   let repoPrivate = false;
+
   try {
     const repo = await ghApi(`/repos/${user}/${slug}`);
     repoExists = true;
     repoPrivate = repo.private;
   } catch(e) {
-    const status = e.status || 0;
-    if (status === 404 || e.message.includes('Not Found')) {
-      repoExists = false; // definitely doesn't exist — proceed to create
-    } else if (status >= 500 || status === 0) {
-      throw new Error(`GitHub unreachable while checking repo: ${e.message}`);
+    if (e.status === 404 || e.message.includes('Not Found')) {
+      repoExists = false;
     } else {
-      // 401 / 403 — auth problem, surface immediately
-      throw new Error(`Repo check failed (HTTP ${status}): ${e.message}`);
+      throw new Error(`Repo check failed (HTTP ${e.status || '?'}): ${e.message}`);
     }
   }
 
-  // ── If private, make it public (Pages needs public on free plans) ──────
   if (repoExists && repoPrivate) {
-    _setDeployStatus('&#x26A0;&#xFE0F;', `Repo "${slug}" is private \u2014 making public for Pages\u2026`, '');
+    _setDeployStatus('&#x26A0;&#xFE0F;', `Making ${slug} public for Pages\u2026`, '');
     try {
       await ghApi(`/repos/${user}/${slug}`, 'PATCH', { private: false });
+      await new Promise(r => setTimeout(r, 1000));
     } catch(e) {
       throw new Error(`Couldn\u2019t make repo public: ${e.message}`);
     }
-    await new Promise(r => setTimeout(r, 1000));
   }
 
-  // ── Create repo if it doesn't exist ────────────────────────────────────
   if (!repoExists) {
     _setDeployStatus('&#x1F527;', `Creating repo ${user}/${slug}\u2026`, '');
     try {
@@ -2417,78 +2656,80 @@ async function _ensureProjectRepo(user, slug, projName) {
         name:        slug,
         description: `${projName} \u2014 deployed via PixelPad v6.8.0`,
         private:     false,
-        auto_init:   true
+        auto_init:   true   // creates initial commit so main branch exists
       });
-      // Wait for GitHub to fully initialise before we push
+      // Wait for GitHub to finish initialising before we push
       _setDeployStatus('&#x23F3;', 'Waiting for repo to initialise\u2026', '');
-      await new Promise(r => setTimeout(r, 3000));
+      await new Promise(r => setTimeout(r, 3500));
     } catch(e) {
-      console.error('[PixelPad Deploy] Repo creation error:', e.ghData || e);
-      const msg = e.message || '';
-      // "Already exists" is not a real error — repo is there, just continue
-      const alreadyExists = msg.includes('already exists') || msg.includes('name already exists') || e.status === 422;
-      if (!alreadyExists) {
+      console.error('[PixelPad Deploy] Create repo error:', e.ghData || e);
+      // "already exists" race — not a real error
+      if (e.status === 422 || (e.message && e.message.includes('already exists'))) {
+        _setDeployStatus('&#x2705;', `Repo exists \u2014 continuing\u2026`, '');
+        await new Promise(r => setTimeout(r, 500));
+      } else {
         let hint = '';
-        if (e.status === 401) hint = 'Your GitHub Token is expired or invalid.';
-        else if (e.status === 403) hint = 'Token lacks permission. Enable the \u201Crepo\u201D scope in GitHub \u2192 Settings \u2192 Developer settings \u2192 Personal access tokens.';
-        else if (e.status === 422) hint = 'GitHub rejected the name. Try renaming your project to something simpler (letters, numbers, hyphens only).';
-        throw new Error(hint ? `${hint}\n\nGitHub said: ${msg}` : `Repo creation failed: ${msg}`);
+        if (e.status === 401) hint = 'Token invalid or expired. ';
+        if (e.status === 403) hint = 'Token needs \u201Crepo\u201D scope. Go to GitHub \u2192 Settings \u2192 Developer settings. ';
+        throw new Error(`${hint}GitHub: ${e.message}`);
       }
-      // Already exists — treat as success, fall through
-      _setDeployStatus('&#x2705;', `Repo ${user}/${slug} already exists \u2014 continuing\u2026`, '');
-      await new Promise(r => setTimeout(r, 600));
-    }
-  }
-
-  // ── Enable GitHub Pages (409 = already on, safe to ignore) ─────────────
-  try {
-    await ghApi(`/repos/${user}/${slug}/pages`, 'POST', {
-      source: { branch: 'main', path: '/' }
-    });
-    await new Promise(r => setTimeout(r, 1000));
-  } catch(e) {
-    const msg = e.message || '';
-    // 409 Conflict / "already enabled" = Pages already on — fine
-    if (!msg.includes('409') && !msg.includes('Conflict') && !msg.includes('already') && e.status !== 409) {
-      _setDeployStatus('&#x26A0;&#xFE0F;', `Pages setup warning: ${msg} \u2014 continuing\u2026`, '');
-      await new Promise(r => setTimeout(r, 1500));
     }
   }
 }
 
+// ── Background poll — user can close modal and keep working ───────────────
 function _pollDeployment(user, slug) {
   clearInterval(_deployPoll);
   let attempts = 0;
-  const MAX = 40; // 80 s max (2 s intervals) — new repos take longer
+  const MAX = 50; // 100s max
 
   _deployPoll = setInterval(async () => {
     attempts++;
+    const elapsed = attempts * 2;
+
     if (attempts > MAX) {
       clearInterval(_deployPoll);
-      // Timeout — surface the URL anyway; Pages may just be slow
-      _finaliseDeployUrl();
+      _deployActive = false;
+      // Surface URL anyway — Pages is usually live even before API reports built
+      _finaliseDeployUrl(true);
       return;
     }
+
+    // Keep pill and modal status in sync
+    _pillShow(`Building\u2026 ${elapsed}s`, '');
+    if (document.getElementById('mod-deploy').classList.contains('on')) {
+      _setDeployStatus('&#x23F3;', `GitHub is building\u2026 ${elapsed}s`, 'mu');
+    }
+
     try {
       const data = await ghApi(`/repos/${user}/${slug}/pages`);
-      if (data && (data.status === 'built' || data.status === 'building')) {
-        if (data.status === 'built') {
-          clearInterval(_deployPoll);
-          _finaliseDeployUrl();
-        }
-        // if 'building', keep polling
+      if (data && data.status === 'built') {
+        clearInterval(_deployPoll);
+        _deployActive = false;
+        _finaliseDeployUrl(false);
       }
-    } catch(e) { /* pages endpoint may 404 briefly after creation — keep polling */ }
+      // queued / building — keep polling
+    } catch(e) {
+      // 404 = Pages not yet registered — keep polling
+      console.log('[PixelPad Deploy] Poll:', e.status, e.message);
+    }
   }, 2000);
 }
 
-function _finaliseDeployUrl() {
-  _setDeployStatus('&#x2705;', 'Deployed! Your test link is ready:', 'ok');
-  document.getElementById('deploy-url-row').classList.add('on');
-  const btn = document.getElementById('deploy-go-btn');
-  btn.disabled = false;
-  btn.style.opacity = '1';
-  btn.textContent = '&#x1F504; Re-deploy';
+function _finaliseDeployUrl(timedOut) {
+  // Update modal if open
+  const modOpen = document.getElementById('mod-deploy').classList.contains('on');
+  if (modOpen) {
+    _setDeployStatus('&#x2705;', timedOut ? 'Link ready (Pages may need ~30s to fully propagate):' : 'Deployed! Your link is live:', 'ok');
+    document.getElementById('deploy-url-row').classList.add('on');
+    const btn = document.getElementById('deploy-go-btn');
+    btn.disabled = false;
+    btn.style.opacity = '1';
+    btn.innerHTML = '&#x1F504; Re-deploy';
+  }
+  // Always show pill + toast so user knows even if modal is closed
+  _pillShow('&#x2705; Deploy ready \u2014 tap to view', 'done');
+  toast('&#x1F680; Deploy complete! Tap the pill to view your link.', 'ok');
 }
 
 function _setDeployStatus(icon, text, cls) {
